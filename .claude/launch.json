@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "BIB Converter Web",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["server.py"],
+      "port": 5000
+    },
+    {
+      "name": "BIB Converter GUI",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["bib_converter.py"],
+      "port": null
+    }
+  ]
+}

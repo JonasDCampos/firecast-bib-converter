@@ -1,0 +1,22 @@
+# PyInstaller
+dist/
+build/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Arquivos gerados pelo conversor (output)
+*.html
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+desktop.ini
