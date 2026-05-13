@@ -1,5 +1,5 @@
 """
-Firecast BIB → HTML  –  Web interface
+Firecast BIB → HTML / Markdown  –  Web interface
 Run:  python server.py
 Then open http://localhost:5000
 """
@@ -9,7 +9,7 @@ import io
 import os
 
 # Reuse all parsing logic from bib_converter
-from bib_converter import convert_bib_to_html
+from bib_converter import convert_bib
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB upload limit
@@ -21,7 +21,7 @@ PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Firecast BIB → HTML</title>
+  <title>Firecast BIB → HTML / Markdown</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -104,6 +104,40 @@ PAGE = """<!DOCTYPE html>
     }
     .btn:hover { background: #1a5276; color: #c9a84c; }
     .btn:disabled { background: #1a1a2e; color: #444; cursor: not-allowed; }
+    .format-row {
+      display: flex;
+      gap: 8px;
+      margin-top: 18px;
+    }
+    .format-row label {
+      flex: 1;
+      cursor: pointer;
+      padding: 10px 14px;
+      border: 1px solid #2a2a4a;
+      border-radius: 6px;
+      text-align: center;
+      font-family: 'Segoe UI', sans-serif;
+      font-size: .9rem;
+      color: #888;
+      background: #0d1117;
+      transition: background .2s, border-color .2s, color .2s;
+      user-select: none;
+    }
+    .format-row label:hover { color: #c9a84c; border-color: #c9a84c66; }
+    .format-row input[type=radio] { display: none; }
+    .format-row input[type=radio]:checked + span {
+      color: #c9a84c;
+      font-weight: bold;
+      letter-spacing: 1px;
+    }
+    .format-row label:has(input:checked) {
+      background: #1a2236;
+      border-color: #c9a84c;
+    }
+    .format-row .fmt-icon {
+      display: inline-block;
+      margin-right: 6px;
+    }
     #status {
       margin-top: 18px;
       font-family: 'Consolas', monospace;
@@ -134,7 +168,7 @@ PAGE = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>Firecast BIB → HTML</h1>
+  <h1>Firecast BIB → HTML / Markdown</h1>
   <p class="subtitle">Conversor de sessões RRPG</p>
 
   <div class="card">
@@ -147,6 +181,18 @@ PAGE = """<!DOCTYPE html>
         <div id="file-name"></div>
         <input type="file" name="file" id="file-input" accept=".bib">
       </div>
+
+      <div class="format-row">
+        <label>
+          <input type="radio" name="format" value="html" checked>
+          <span><span class="fmt-icon">📄</span>HTML</span>
+        </label>
+        <label>
+          <input type="radio" name="format" value="markdown">
+          <span><span class="fmt-icon">📝</span>Markdown</span>
+        </label>
+      </div>
+
       <button class="btn" type="submit" id="btn" disabled>⚙ Converter</button>
     </form>
     <div id="status"></div>
@@ -193,8 +239,12 @@ PAGE = """<!DOCTYPE html>
       btn.disabled = true;
       status.innerHTML = '<span class="spinner"></span><span class="status-inf">Convertendo…</span>';
 
+      const fmt = document.querySelector('input[name=format]:checked').value;
+      const ext = fmt === 'markdown' ? '.md' : '.html';
+
       const data = new FormData();
       data.append('file', input.files[0]);
+      data.append('format', fmt);
 
       try {
         const res = await fetch('/convert', { method: 'POST', body: data });
@@ -208,7 +258,7 @@ PAGE = """<!DOCTYPE html>
         const blob = await res.blob();
         const url  = URL.createObjectURL(blob);
         const a    = document.createElement('a');
-        const orig = input.files[0].name.replace(/\\.bib$/i, '.html');
+        const orig = input.files[0].name.replace(/\\.bib$/i, ext);
         a.href = url; a.download = orig; a.click();
         URL.revokeObjectURL(url);
         status.innerHTML = `<span class="status-ok">✓ ${orig} pronto — download iniciado!</span>`;
@@ -240,23 +290,29 @@ def convert():
     if not f.filename.lower().endswith('.bib'):
         return jsonify(error='Apenas arquivos .bib são aceitos.'), 400
 
-    # Save to a temp file, convert, return HTML
+    fmt = (request.form.get('format') or 'html').lower()
+    if fmt not in ('html', 'markdown', 'md'):
+        return jsonify(error=f'Formato inválido: {fmt}'), 400
+
+    # Save to a temp file, convert, return the produced file
     import tempfile, shutil
     tmp_dir = tempfile.mkdtemp()
     try:
-        bib_path  = os.path.join(tmp_dir, f.filename)
-        html_path = os.path.splitext(bib_path)[0] + '.html'
-
+        bib_path = os.path.join(tmp_dir, f.filename)
         f.save(bib_path)
-        convert_bib_to_html(bib_path)   # writes html_path
 
-        with open(html_path, 'rb') as fh:
+        out_path, _ = convert_bib(bib_path, fmt)
+
+        with open(out_path, 'rb') as fh:
             data = fh.read()
 
-        out_name = os.path.basename(html_path)
+        mimetype = ('text/markdown; charset=utf-8'
+                    if fmt in ('markdown', 'md')
+                    else 'text/html; charset=utf-8')
+        out_name = os.path.basename(out_path)
         return send_file(
             io.BytesIO(data),
-            mimetype='text/html; charset=utf-8',
+            mimetype=mimetype,
             as_attachment=True,
             download_name=out_name,
         )

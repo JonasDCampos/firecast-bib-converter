@@ -9,11 +9,16 @@ from tkinter import filedialog, ttk, scrolledtext
 import zlib
 import xml.etree.ElementTree as ET
 import os
+import re
 import threading
 from html import escape
 
-SEPARATOR = b'\x96\xea\x02\x00\x00\x00\x00\x00\x96\xea\x95\x00'
-HEADER_SIZE = 21
+# Binary markers inside the decompressed RRPG data
+ITEM_MARKER  = b'\xcd\xab\x85\x11'                                  # precedes every folder/session entry
+TYPE_FOLDER  = b'\x02\x00\x00\x00'
+TYPE_SESSION = b'\x06\x03\x00\x00'
+SEPARATOR    = b'\x96\xea\x02\x00\x00\x00\x00\x00\x96\xea\x95\x00'  # separates session header from XML
+HEADER_SIZE  = 21
 
 
 # ──────────────────────────────────────────────
@@ -60,65 +65,145 @@ def parse_xml_session(xml_bytes):
     return paragraphs
 
 
-def find_sessions(data):
-    """Locate all session blocks in the decompressed data.
+def find_items(data):
+    """Walk the decompressed data and extract every folder / session entry.
 
-    Returns list of (name: str, xml_bytes: bytes).
+    Format of each entry (observed by reverse-engineering):
+        marker (4)         = \xcd\xab\x85\x11
+        name_len (4, LE)
+        type (4)           = \x02\x00\x00\x00 (folder) or \x06\x03\x00\x00 (session)
+        padding (5)
+        name (name_len bytes, UTF-8)
+        — sessions are followed by SEPARATOR + 4-byte XML size + XML bytes
+
+    Returns list of dicts:
+        {'kind': 'folder'|'session', 'name': str, 'pos': int, 'xml': bytes (sessions only)}
+    in storage order.
     """
-    sessions = []
+    items = []
 
-    sep_positions = []
+    positions = []
     pos = 0
     while True:
-        p = data.find(SEPARATOR, pos)
+        p = data.find(ITEM_MARKER, pos)
         if p == -1:
             break
-        sep_positions.append(p)
+        positions.append(p)
         pos = p + 1
 
-    for idx, sep_pos in enumerate(sep_positions):
-        # Name: bytes between the last \x00 and the separator
-        null_pos = -1
-        for i in range(sep_pos - 1, max(sep_pos - 256, -1), -1):
-            if data[i] == 0:
-                null_pos = i
-                break
-        name_start = null_pos + 1 if null_pos >= 0 else 0
+    for idx, mark_pos in enumerate(positions):
+        after_marker = mark_pos + 4
+        if after_marker + 8 > len(data):
+            continue
+
+        name_len   = int.from_bytes(data[after_marker:after_marker + 4], 'little')
+        type_field = data[after_marker + 4:after_marker + 8]
+
+        # 5-byte gap between type field and name
+        name_start = after_marker + 8 + 5
+        name_end   = name_start + name_len
+        if name_end > len(data) or name_len <= 0 or name_len > 512:
+            continue
+
         try:
-            name = data[name_start:sep_pos].decode('utf-8', errors='replace').strip()
+            name = data[name_start:name_end].decode('utf-8', errors='replace').strip()
         except Exception:
-            name = f'Sessão {idx + 1}'
+            name = f'Item {idx + 1}'
         if not name:
-            name = f'Sessão {idx + 1}'
+            name = f'Item {idx + 1}'
 
-        # 4-byte little-endian size after separator
-        after_sep = sep_pos + len(SEPARATOR)
-        if after_sep + 4 > len(data):
-            break
-        size = int.from_bytes(data[after_sep:after_sep + 4], 'little')
-        xml_start = after_sep + 4
+        next_item_pos = positions[idx + 1] if idx + 1 < len(positions) else len(data)
 
-        # Upper bound = start of next session's name (or end of data)
-        max_end = len(data)
-        if idx + 1 < len(sep_positions):
-            next_sep = sep_positions[idx + 1]
-            for i in range(next_sep - 1, max(next_sep - 256, -1), -1):
-                if data[i] == 0:
-                    max_end = i
-                    break
+        if type_field == TYPE_FOLDER:
+            items.append({'kind': 'folder', 'name': name, 'pos': mark_pos})
+
+        elif type_field == TYPE_SESSION:
+            # SEPARATOR should sit right after the name
+            sep_pos = name_end
+            if data[sep_pos:sep_pos + len(SEPARATOR)] != SEPARATOR:
+                fallback = data.find(SEPARATOR, name_end, name_end + 64)
+                if fallback == -1:
+                    continue
+                sep_pos = fallback
+
+            after_sep = sep_pos + len(SEPARATOR)
+            if after_sep + 4 > len(data):
+                continue
+            size = int.from_bytes(data[after_sep:after_sep + 4], 'little')
+            xml_start = after_sep + 4
+
+            if size > 0 and xml_start + size <= next_item_pos:
+                xml_data = data[xml_start:xml_start + size]
             else:
-                max_end = next_sep
+                xml_data = data[xml_start:next_item_pos]
 
-        if size > 0 and xml_start + size <= max_end:
-            xml_data = data[xml_start:xml_start + size]
+            xml_data = xml_data.rstrip(b'\x00')
+            if xml_data:
+                items.append({'kind': 'session', 'name': name,
+                              'pos': mark_pos, 'xml': xml_data})
+
+    return items
+
+
+_SESSION_NUM_RE = re.compile(r'Sess[ãa]o\s+(\d+)(?:\.(\d+))?', re.IGNORECASE)
+
+
+def session_sort_key(name):
+    """Build a sort key from the session name.
+
+    'Sessão 1'        → (0, 1, 0, ...)
+    'Sessão 1.1 - X'  → (0, 1, 1, ...)
+    'Sessão 9.2'      → (0, 9, 2, ...)
+    Names without a recognizable number sort to the end.
+    """
+    m = _SESSION_NUM_RE.search(name)
+    if m:
+        major = int(m.group(1))
+        minor = int(m.group(2)) if m.group(2) else 0
+        return (0, major, minor, name.lower())
+    return (1, 0, 0, name.lower())
+
+
+def group_sessions(items):
+    """Group sessions under their preceding folder; sort sessions within each group.
+
+    Returns list of tuples: [(folder_dict_or_None, [session_dict, ...]), ...]
+    Folders are kept in storage order; sessions inside are numerically sorted.
+    """
+    groups = []
+    current_folder   = None
+    current_sessions = []
+    folder_started   = False
+
+    for it in items:
+        if it['kind'] == 'folder':
+            if current_sessions or folder_started:
+                groups.append((current_folder, current_sessions))
+            current_folder   = it
+            current_sessions = []
+            folder_started   = True
         else:
-            xml_data = data[xml_start:max_end]
+            current_sessions.append(it)
 
-        xml_data = xml_data.rstrip(b'\x00')
-        if xml_data:
-            sessions.append((name, xml_data))
+    groups.append((current_folder, current_sessions))
+    # Drop groups that are empty AND have no folder header
+    groups = [(f, s) for f, s in groups if s or f is not None]
 
-    return sessions
+    for _, sessions in groups:
+        sessions.sort(key=lambda s: session_sort_key(s['name']))
+
+    return groups
+
+
+def find_sessions(data):
+    """Backwards-compatible helper: returns [(name, xml_bytes), ...] correctly ordered."""
+    items  = find_items(data)
+    groups = group_sessions(items)
+    out = []
+    for _, sessions in groups:
+        for s in sessions:
+            out.append((s['name'], s['xml']))
+    return out
 
 
 def elements_to_html(elements):
@@ -166,6 +251,18 @@ HTML_HEAD = """\
       border-bottom: 2px solid #c9a84c66;
       padding-bottom: 12px;
     }}
+    h2.folder-header {{
+      color: #c9a84c;
+      font-size: 1.35rem;
+      text-align: center;
+      margin: 48px 0 24px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      border-top: 2px solid #c9a84c;
+      border-bottom: 2px solid #c9a84c;
+      padding: 12px 0;
+      background: #12122044;
+    }}
     .session-header {{
       color: #c9a84c;
       font-size: 1.15rem;
@@ -202,8 +299,8 @@ HTML_HEAD = """\
 HTML_FOOT = "</body>\n</html>\n"
 
 
-def convert_bib_to_html(bib_path):
-    """Read → decompress → parse → write HTML. Returns (html_path, session_count)."""
+def _decompress_bib(bib_path):
+    """Read .bib, locate the zlib block, return the decompressed payload."""
     with open(bib_path, 'rb') as f:
         raw = f.read()
 
@@ -216,32 +313,51 @@ def convert_bib_to_html(bib_path):
     if zlib_pos == -1:
         raise ValueError("Bloco zlib não encontrado no arquivo.")
 
-    decompressed = zlib.decompress(search_area[zlib_pos:])
-    sessions = find_sessions(decompressed)
-    if not sessions:
+    return zlib.decompress(search_area[zlib_pos:])
+
+
+def _load_grouped_sessions(bib_path):
+    """Return (title, groups, total_count) ready for rendering."""
+    decompressed = _decompress_bib(bib_path)
+    items  = find_items(decompressed)
+    groups = group_sessions(items)
+    total  = sum(len(s) for _, s in groups)
+    if total == 0:
         raise ValueError("Nenhuma sessão encontrada após a descompressão.")
-
     title = os.path.splitext(os.path.basename(bib_path))[0]
+    return title, groups, total
+
+
+def convert_bib_to_html(bib_path):
+    """Read → decompress → parse → write HTML. Returns (html_path, session_count)."""
+    title, groups, total = _load_grouped_sessions(bib_path)
+
     parts = [HTML_HEAD.format(title=escape(title))]
+    session_idx = 0
 
-    for idx, (name, xml_bytes) in enumerate(sessions):
-        if idx > 0:
-            parts.append('<hr class="divider">')
-        parts.append(f'<div class="session-header">{escape(name)}</div>')
-        parts.append('<div class="session-body">')
+    for folder, sessions in groups:
+        if folder is not None:
+            parts.append(f'<h2 class="folder-header">{escape(folder["name"])}</h2>')
 
-        paragraphs = parse_xml_session(xml_bytes)
-        if paragraphs:
-            for elems in paragraphs:
-                if not elems:
-                    parts.append('<div class="p">&nbsp;</div>')
-                else:
-                    parts.append('<div class="p">' + elements_to_html(elems) + '</div>')
-        else:
-            parts.append('<div class="p" style="color:#666;font-style:italic;">'
-                         '(sem conteúdo legível)</div>')
+        for s in sessions:
+            if session_idx > 0:
+                parts.append('<hr class="divider">')
+            session_idx += 1
+            parts.append(f'<div class="session-header">{escape(s["name"])}</div>')
+            parts.append('<div class="session-body">')
 
-        parts.append('</div>')
+            paragraphs = parse_xml_session(s['xml'])
+            if paragraphs:
+                for elems in paragraphs:
+                    if not elems:
+                        parts.append('<div class="p">&nbsp;</div>')
+                    else:
+                        parts.append('<div class="p">' + elements_to_html(elems) + '</div>')
+            else:
+                parts.append('<div class="p" style="color:#666;font-style:italic;">'
+                             '(sem conteúdo legível)</div>')
+
+            parts.append('</div>')
 
     parts.append(HTML_FOOT)
 
@@ -249,7 +365,92 @@ def convert_bib_to_html(bib_path):
     with open(html_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(parts))
 
-    return html_path, len(sessions)
+    return html_path, total
+
+
+# ──────────────────────────────────────────────
+# Markdown converter
+# ──────────────────────────────────────────────
+
+_MD_ESCAPE_RE = re.compile(r'([\\`*_{}\[\]()#+\-.!>|])')
+
+
+def _md_escape(text):
+    """Escape Markdown-significant characters inside inline runs."""
+    return _MD_ESCAPE_RE.sub(r'\\\1', text)
+
+
+def elements_to_markdown(elements):
+    """Convert a list of element dicts to a Markdown inline string.
+
+    Bold → **text**, italic → _text_, colors are dropped.
+    """
+    parts = []
+    for elem in elements:
+        text  = elem['text']
+        style = elem['style']
+        if not text:
+            continue
+
+        out = _md_escape(text)
+        # Keep wrapping whitespace outside emphasis markers so they hug visible text
+        leading  = len(out) - len(out.lstrip())
+        trailing = len(out) - len(out.rstrip())
+        core = out[leading:len(out) - trailing] if trailing else out[leading:]
+        prefix = out[:leading]
+        suffix = out[len(out) - trailing:] if trailing else ''
+
+        if core:
+            if 'b' in style:
+                core = f'**{core}**'
+            if 'i' in style:
+                core = f'_{core}_'
+
+        parts.append(prefix + core + suffix)
+    return ''.join(parts)
+
+
+def convert_bib_to_markdown(bib_path):
+    """Read → decompress → parse → write Markdown. Returns (md_path, session_count)."""
+    title, groups, total = _load_grouped_sessions(bib_path)
+
+    lines = [f'# {title}', '']
+
+    for folder, sessions in groups:
+        if folder is not None:
+            lines.append(f'## {folder["name"]}')
+            lines.append('')
+
+        for s in sessions:
+            lines.append(f'### {s["name"]}')
+            lines.append('')
+
+            paragraphs = parse_xml_session(s['xml'])
+            if paragraphs:
+                for elems in paragraphs:
+                    if not elems:
+                        lines.append('')
+                    else:
+                        lines.append(elements_to_markdown(elems))
+            else:
+                lines.append('_(sem conteúdo legível)_')
+            lines.append('')
+            lines.append('---')
+            lines.append('')
+
+    md_path = os.path.splitext(bib_path)[0] + '.md'
+    with open(md_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+
+    return md_path, total
+
+
+def convert_bib(bib_path, fmt='html'):
+    """Dispatch to the chosen format. fmt ∈ {'html', 'markdown', 'md'}."""
+    fmt = (fmt or 'html').lower()
+    if fmt in ('md', 'markdown'):
+        return convert_bib_to_markdown(bib_path)
+    return convert_bib_to_html(bib_path)
 
 
 # ──────────────────────────────────────────────
@@ -272,12 +473,13 @@ DROP_HOVER = '#1e2a4a'
 class BibConverterApp:
     def __init__(self, root):
         self.root = root
-        self.root.title('Firecast BIB → HTML Converter')
+        self.root.title('Firecast BIB → HTML / Markdown Converter')
         self.root.configure(bg=DARK_BG)
-        self.root.minsize(620, 520)
+        self.root.minsize(620, 560)
         self.root.resizable(True, True)
 
         self.selected_files = []
+        self.output_format  = tk.StringVar(value='html')   # 'html' | 'markdown'
         self._build_ui()
 
         if HAS_DND:
@@ -290,12 +492,30 @@ class BibConverterApp:
         top = tk.Frame(self.root, bg=PANEL_BG, pady=14)
         top.pack(fill='x')
 
-        tk.Label(top, text='Firecast  BIB → HTML',
+        tk.Label(top, text='Firecast  BIB → HTML / Markdown',
                  bg=PANEL_BG, fg=ACCENT,
                  font=('Georgia', 16, 'bold')).pack()
-        tk.Label(top, text='Converte arquivos de sessão do RRPG em HTML legível',
+        tk.Label(top, text='Converte arquivos de sessão do RRPG em HTML ou Markdown',
                  bg=PANEL_BG, fg='#888',
                  font=('Georgia', 9)).pack(pady=(2, 0))
+
+        # Format selector
+        fmt_frame = tk.Frame(self.root, bg=DARK_BG, pady=10, padx=16)
+        fmt_frame.pack(fill='x')
+
+        tk.Label(fmt_frame, text='Formato de saída:',
+                 bg=DARK_BG, fg='#888',
+                 font=('Segoe UI', 9)).pack(side='left', padx=(0, 12))
+
+        for label, value in (('HTML', 'html'), ('Markdown', 'markdown')):
+            rb = tk.Radiobutton(
+                fmt_frame, text=label, variable=self.output_format, value=value,
+                bg=DARK_BG, fg=TEXT_FG,
+                activebackground=DARK_BG, activeforeground=ACCENT,
+                selectcolor=BTN_BG, font=('Segoe UI', 9, 'bold'),
+                cursor='hand2', highlightthickness=0, bd=0,
+            )
+            rb.pack(side='left', padx=(0, 12))
 
         # Buttons
         btn_frame = tk.Frame(self.root, bg=DARK_BG, pady=12, padx=16)
@@ -516,16 +736,18 @@ class BibConverterApp:
         total  = len(self.selected_files)
         ok     = 0
         failed = 0
+        fmt    = self.output_format.get()
+        fmt_label = 'Markdown' if fmt == 'markdown' else 'HTML'
 
-        self._log(f'Iniciando conversão de {total} arquivo(s)…', 'info')
+        self._log(f'Iniciando conversão de {total} arquivo(s) para {fmt_label}…', 'info')
 
         for i, path in enumerate(self.selected_files, 1):
             fname = os.path.basename(path)
             self._log(f'[{i}/{total}] {fname}', 'warn')
             try:
-                html_path, n_sessions = convert_bib_to_html(path)
+                out_path, n_sessions = convert_bib(path, fmt)
                 self._log(
-                    f'  ✓  {n_sessions} sessão(ões) → {os.path.basename(html_path)}',
+                    f'  ✓  {n_sessions} sessão(ões) → {os.path.basename(out_path)}',
                     'success')
                 ok += 1
             except Exception as exc:
